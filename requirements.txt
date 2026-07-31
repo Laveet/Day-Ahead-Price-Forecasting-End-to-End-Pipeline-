@@ -1,0 +1,6 @@
+pandas
+numpy
+lightgbm
+entsoe-py
+python-dotenv
+pyarrow
