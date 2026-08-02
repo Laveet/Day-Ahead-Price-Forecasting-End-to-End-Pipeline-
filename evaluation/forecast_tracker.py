@@ -65,8 +65,7 @@ def save_forecast(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     filename = (
-        f"forecast_target={target_ts.date()}"
-        f"_generated={generated_at.strftime('%Y%m%dT%H%M%S')}.parquet"
+        f"forecast_target={target_ts.date()}.parquet"
     )
     out.to_parquet(out_dir / filename, index=False)
     print(f"Saved forecast for {target_ts.date()} -> {out_dir / filename}")
@@ -91,7 +90,7 @@ def load_latest_forecast(
     if not search_dir.exists():
         return None
 
-    matches = sorted(search_dir.glob(f"forecast_target={target_ts.date()}_generated=*.parquet"))
+    matches = sorted(search_dir.glob(f"forecast_target={target_ts.date()}*.parquet"))
     if not matches:
         return None
 

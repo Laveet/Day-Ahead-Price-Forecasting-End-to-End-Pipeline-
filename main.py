@@ -17,13 +17,13 @@ from data.historical_loader import load_all_historical, clean_and_merge_data
 from pipeline.daily_pipeline import run_day_ahead_pipeline
 
 if __name__ == "__main__":
-    today = sys.argv[1] if len(sys.argv) > 1 else "today"
-    print(today)
+    # today = sys.argv[1] if len(sys.argv) > 1 else "today"
+    # print(today)
 
     raw_data = load_all_historical()
     master_energy_df = clean_and_merge_data(raw_data)
 
-    master_updated, model, forecast_result = run_day_ahead_pipeline(master_energy_df, today)
+    master_updated, model, forecast_result = run_day_ahead_pipeline(master_energy_df, "2026-08-01")
 
     print("\nForecast:")
     print(forecast_result)
