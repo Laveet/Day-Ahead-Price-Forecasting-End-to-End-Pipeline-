@@ -1,97 +1,136 @@
 """
 daily_pipeline.py
 
-Orchestrates the full day-ahead workflow. Every run now closes the loop
-automatically:
+Orchestrates the day-ahead workflow with the information set a trader
+actually has at gate closure.
 
-  0) Evaluate yesterday's forecast — if a forecast was archived for
-     `day_x`, it's compared against the actuals that just arrived, and
-     the comparison + metrics are saved. (Skipped silently on the very
-     first run, when no forecast exists yet.)
-  1) Download & append today's actuals
-  2) Feature engineer + train on the updated history
-  3) Download tomorrow's forecasts
-  4) Build the unified feature matrix for tomorrow
-  5) Predict tomorrow's 24 hourly prices AND archive the forecast, so
-     step 0 has something to grade the next time the pipeline runs.
+Market timeline (EPEX / SDAC, DE-LU)
+------------------------------------
+Run on the MORNING of day D (before the 12:00 CET gate closure). The bids
+submitted before 12:00 on D are for delivery day D+1.
+
+    What is known on D before 12:00      How it is used
+    --------------------------------      -----------------------------------
+    prices for all of D                   price lag 24 for D+1, grading the
+      (cleared in the D-1 auction)          forecast made yesterday for D
+    actual load / generation up to D-1    training rows, load lags >= 48 h
+    load + wind/solar FORECASTS for D+1   inputs for the D+1 feature rows
+
+    NOT known yet: D's actual load and generation (D hasn't ended) and
+    therefore anything derived from them, e.g. load lag 24 for D+1.
+
+The old version took `day_x`'s full actuals (only available after day_x
+ends) and then forecast day_x+1, whose auction had already closed at noon
+on day_x. The forecast could not have been used for bidding.
+
+Every run:
+  1) actual load + generation for D-1 (+ its prices) -> full history rows
+  2) prices for D                                     -> price-only rows
+  3) grade the forecast archived yesterday for D
+  4) feature engineering + training on the updated history
+  5) download D+1 load and wind/solar forecasts
+  6) predict all hours of delivery day D+1 and archive the forecast
 """
 
 from __future__ import annotations
 import pandas as pd
 
 from config import DEFAULT_BIDDING_ZONE, MODEL_FEATURES
-from data.live_data import fetch_align_and_save_live_data
+from data.live_data import fetch_and_save_prices, fetch_align_and_save_live_data
 from data.forecast_data import fetch_next_day_forecast_inputs
+from data.market_time import hours_in_delivery_day, local_date
 from features.engineering import engineer_features
 from models.training import train_price_model
 from evaluation.forecast_tracker import save_forecast, compare_forecast_vs_actual
 
 
+def _append(master: pd.DataFrame, chunk: pd.DataFrame | None) -> pd.DataFrame:
+    if chunk is None or chunk.empty:
+        return master
+    out = pd.concat([master, chunk], ignore_index=True)
+    return (
+        out.drop_duplicates(subset=["timestamp", "bidding_zone"], keep="last")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+
 def run_day_ahead_pipeline(
     master_data: pd.DataFrame,
-    day_x: str,
+    run_date: str,
     bidding_zone: str = DEFAULT_BIDDING_ZONE,
 ):
     """
     Parameters
     ----------
-    master_data : your existing master_energy_df
-    day_x : "today" as a string, e.g. "2026-07-30" — the day whose
-        actuals just became available.
+    master_data : master_energy_df from historical_loader
+    run_date : day D, the day you are running on (before 12:00 CET),
+        e.g. "2026-09-26". The forecast is produced for delivery day D+1.
 
     Returns
     -------
     (master_updated, model, forecast_result)
     """
-    print(f"Processing {day_x}")
+    D = pd.Timestamp(run_date)
+    d_prev = (D - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    d_today = D.strftime("%Y-%m-%d")
+    d_target = (D + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    print(f"Run date D={d_today} | actuals through {d_prev} | prices through {d_today} "
+          f"| forecasting delivery day {d_target}")
 
-    # ---- STEP 1: download & append today's actuals ----------------------
-    actual_day = fetch_align_and_save_live_data(day_x, bidding_zone)
+    # ---- STEP 1: complete actuals for D-1 ---------------------------------
+    actual_prev = fetch_align_and_save_live_data(d_prev, bidding_zone)
+    master_updated = _append(master_data, actual_prev)
 
-    # ---- STEP 0 (runs here, once actuals exist): grade yesterday's forecast
-    compare_forecast_vs_actual(actual_day, day_x, bidding_zone)
+    # ---- STEP 2: prices for D (known since yesterday's auction) -----------
+    # Appended AFTER the full rows, so these price-only rows never overwrite
+    # a complete row. Load/generation stay NaN for D -> those rows are used
+    # for price lags / rolling stats but dropped from training.
+    prices_today = fetch_and_save_prices(d_today, bidding_zone)
+    if prices_today is None or prices_today.empty:
+        raise RuntimeError(
+            f"No day-ahead prices for {d_today} yet. They are published after "
+            f"the auction on {d_prev} (~12:45 CET); without them the D+1 "
+            "forecast would have no price lag 24."
+        )
+    master_updated = _append(master_updated, prices_today)
 
-    master_updated = pd.concat([master_data, actual_day], ignore_index=True)
-    master_updated = (
-        master_updated
-        .drop_duplicates(subset=["timestamp", "bidding_zone"], keep="last")
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
+    # ---- STEP 3: grade yesterday's forecast for D --------------------------
+    compare_forecast_vs_actual(prices_today, d_today, bidding_zone)
 
-    # ---- STEP 2: feature engineer + train on updated history -----------
+    # ---- STEP 4: feature engineer + train ----------------------------------
     features = engineer_features(master_updated)
     model = train_price_model(features)
 
-    # ---- STEP 3: download tomorrow's forecasts --------------------------
-    next_day = (pd.Timestamp(day_x) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    forecast_inputs = fetch_next_day_forecast_inputs(next_day, bidding_zone)
-    print(forecast_inputs.tail(10))
-    # ---- STEP 4: unified timeline -> one feature engineering call ------
+    # ---- STEP 5: forecasts for D+1 -----------------------------------------
+    forecast_inputs = fetch_next_day_forecast_inputs(d_target, bidding_zone)
+
+    # ---- STEP 6: unified timeline -> one feature-engineering call ----------
     combined = pd.concat([master_updated, forecast_inputs], ignore_index=True)
     combined["bidding_zone"] = combined["bidding_zone"].ffill().bfill()
     combined_features = engineer_features(combined)
-   
+
     future_features = combined_features[
-        combined_features.timestamp.dt.date == pd.Timestamp(next_day).date()
+        local_date(combined_features.timestamp) == pd.Timestamp(d_target).date()
     ]
-    
 
-    # if len(future_features) != 24:
-    #     raise ValueError(
-    #         f"Expected 24 forecast rows for {next_day}, got {len(future_features)}. "
-    #         "Check that the ENTSO-E forecast query returned a full day."
-    #     )
+    expected = hours_in_delivery_day(d_target)   # 23 / 24 / 25
+    if len(future_features) != expected:
+        raise ValueError(
+            f"Expected {expected} forecast rows for delivery day {d_target}, "
+            f"got {len(future_features)}. Check the ENTSO-E forecast download."
+        )
 
-    # nan_mask = future_features[MODEL_FEATURES].isna()
-    # if nan_mask.any().any():
-    #     bad_cols = future_features[MODEL_FEATURES].columns[nan_mask.any()].tolist()
-    #     raise ValueError(
-    #         f"NaNs in forecast feature matrix for columns: {bad_cols}. "
-    #         "Likely a forecast column-naming mismatch or insufficient history for lag_168."
-    #     )
+    nan_cols = future_features[MODEL_FEATURES].columns[
+        future_features[MODEL_FEATURES].isna().any()
+    ].tolist()
+    if nan_cols:
+        # LightGBM can predict through NaNs, so warn instead of failing. A
+        # known case: on the 25-hour October DST day the last hour's lag-48
+        # load falls on D itself, which is not known yet.
+        print(f"  WARNING: NaNs in forecast features {nan_cols} — "
+              "LightGBM will use its missing-value branches for those rows.")
 
-    # ---- STEP 5: predict + archive ----------------------------------------
     predictions = model.predict(future_features[MODEL_FEATURES])
 
     forecast_result = pd.DataFrame({
@@ -99,6 +138,6 @@ def run_day_ahead_pipeline(
         "forecast_price_eur_mwh": predictions,
     })
 
-    save_forecast(forecast_result, next_day, bidding_zone)
+    save_forecast(forecast_result, d_target, bidding_zone)
 
     return master_updated, model, forecast_result

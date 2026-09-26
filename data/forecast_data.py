@@ -20,13 +20,15 @@ import pandas as pd
 
 from config import DEFAULT_BIDDING_ZONE
 from data.entsoe_client import get_client
+from data.market_time import delivery_day_bounds
 
 
 def fetch_next_day_forecast_inputs(target_date_str: str, bidding_zone: str = DEFAULT_BIDDING_ZONE) -> pd.DataFrame:
     client = get_client()
 
-    start = pd.Timestamp(target_date_str, tz="UTC")
-    end = start + pd.Timedelta(days=1)
+    # Local delivery day [00:00, 24:00) Europe/Berlin, exclusive end —
+    # the same hours the D-1 auction actually clears (23/25 on DST days).
+    start, end = delivery_day_bounds(target_date_str)
 
     print(f"Downloading forecasts for {target_date_str}...")
 
@@ -56,6 +58,8 @@ def fetch_next_day_forecast_inputs(target_date_str: str, bidding_zone: str = DEF
     df_gen = df_gen.set_index("timestamp").resample("h").mean().reset_index()
 
     result = pd.merge(df_load, df_gen, on="timestamp", how="outer")
+    start_utc, end_utc = start.tz_convert("UTC"), end.tz_convert("UTC")
+    result = result[(result.timestamp >= start_utc) & (result.timestamp < end_utc)]
 
     # Small edge gaps can appear after the 15-min -> hourly resample
     # (usually a UTC / local bidding-zone boundary mismatch). These are

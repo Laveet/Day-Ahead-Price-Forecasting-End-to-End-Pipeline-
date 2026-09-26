@@ -23,11 +23,26 @@ EVALUATION_DIR = LAKEHOUSE_ROOT / "evaluation"
 # ---------------------------------------------------------------------
 DEFAULT_BIDDING_ZONE = "DE_LU"
 
+# Delivery days, auctions and gate closure are defined in LOCAL market time,
+# not UTC. A German delivery day is 00:00-24:00 Europe/Berlin
+# (= 22:00-22:00 UTC in summer, 23:00-23:00 UTC in winter; 23 or 25 hours
+# on DST-change days). Timestamps are still STORED in UTC; this timezone is
+# only used to decide which UTC hours belong to which delivery day.
+MARKET_TZ = "Europe/Berlin"
+
 # ---------------------------------------------------------------------
 # Feature engineering config
 # ---------------------------------------------------------------------
-LAG_HOURS = [24, 48, 168]
-LAG_COLUMNS = ["price_eur_mwh", "total_load_mw", "residual_load_mw"]
+# Lags per column are chosen by what is KNOWN at gate closure
+# (12:00 CET on day D, bidding for delivery day D+1):
+#   - prices for all of D were set in yesterday's auction -> lag 24 is known
+#   - actual load / generation are only complete up to the end of D-1
+#     -> lag 24 (= hours of D) is NOT known yet, the smallest usable lag is 48
+LAG_SPEC = {
+    "price_eur_mwh": [24, 48, 168],
+    "total_load_mw": [48, 168],
+    "residual_load_mw": [48, 168],
+}
 ROLLING_WINDOW = 24
 
 # ---------------------------------------------------------------------
@@ -56,11 +71,9 @@ MODEL_FEATURES = [
     "price_eur_mwh_lag_48",
     "price_eur_mwh_lag_168",
 
-    "total_load_mw_lag_24",
     "total_load_mw_lag_48",
     "total_load_mw_lag_168",
 
-    "residual_load_mw_lag_24",
     "residual_load_mw_lag_48",
     "residual_load_mw_lag_168",
 

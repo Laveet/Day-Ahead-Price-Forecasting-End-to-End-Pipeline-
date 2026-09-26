@@ -22,7 +22,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from config import LAG_HOURS, LAG_COLUMNS, ROLLING_WINDOW
+from config import LAG_SPEC, ROLLING_WINDOW, MARKET_TZ
 
 
 def engineer_features(master_data: pd.DataFrame) -> pd.DataFrame:
@@ -45,10 +45,14 @@ def engineer_features(master_data: pd.DataFrame) -> pd.DataFrame:
         df["bidding_zone"] = df["bidding_zone"].fillna(zone)
 
     # -- 1. Calendar features -----------------------------------------
-    df["hour"] = df.timestamp.dt.hour
-    df["dayofweek"] = df.timestamp.dt.dayofweek
-    df["month"] = df.timestamp.dt.month
-    df["dayofyear"] = df.timestamp.dt.dayofyear
+    # Calendar features in LOCAL market time: demand, peak/off-peak and the
+    # delivery day all follow Berlin clocks, so "hour 8" must mean 08:00
+    # local in summer and winter alike (in UTC it would shift by 1h at DST).
+    local_ts = df.timestamp.dt.tz_convert(MARKET_TZ)
+    df["hour"] = local_ts.dt.hour
+    df["dayofweek"] = local_ts.dt.dayofweek
+    df["month"] = local_ts.dt.month
+    df["dayofyear"] = local_ts.dt.dayofyear
     df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype(int)
 
     df["hour_sin"] = np.sin(2 * np.pi * df.hour / 24)
@@ -65,8 +69,12 @@ def engineer_features(master_data: pd.DataFrame) -> pd.DataFrame:
     )
 
     # -- 3. Lag features --------------------------------------------------
-    for col in LAG_COLUMNS:
-        for lag in LAG_HOURS:
+    # Lags per column follow what is known at gate closure (see LAG_SPEC in
+    # config.py): price lag 24 is fine (D prices are known), but load /
+    # residual-load start at lag 48 because D's actuals are not complete
+    # when the D+1 bids must be submitted.
+    for col, lags in LAG_SPEC.items():
+        for lag in lags:
             df[f"{col}_lag_{lag}"] = df[col].shift(lag)
 
     # -- 4. Rolling price stats (leak-free, frozen for forecast rows) ----

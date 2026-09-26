@@ -57,6 +57,19 @@ def clean_and_merge_data(raw_data_dict: dict, missing_threshold: float = 0.90) -
             price_cols.append("bidding_zone")
         df_price = df_price[price_cols]
 
+        # Since 1 Oct 2025 DE-LU day-ahead prices are 15-minute products
+        # (96/day). Load and generation are resampled to hourly below, so
+        # prices must be too — otherwise the merge keeps only the :00
+        # quarter-hour and the target silently becomes "first-quarter-hour
+        # price" instead of the hourly average. Hourly data (pre-Oct 2025)
+        # passes through unchanged.
+        df_price.set_index("timestamp", inplace=True)
+        agg_price = {"price_eur_mwh": "mean"}
+        if "bidding_zone" in df_price.columns:
+            agg_price["bidding_zone"] = "first"
+        df_price = df_price.resample("h").agg(agg_price).reset_index()
+        df_price = df_price.dropna(subset=["price_eur_mwh"])
+
     # --- 2. Clean Total Load ---
     df_load = raw_data_dict.get("total_load")
     if df_load is not None:
@@ -125,13 +138,17 @@ def clean_and_merge_data(raw_data_dict: dict, missing_threshold: float = 0.90) -
         merge_keys = ["timestamp"]
         if "bidding_zone" in master_df.columns and "bidding_zone" in df_load.columns:
             merge_keys.append("bidding_zone")
-        master_df = pd.merge(master_df, df_load, on=merge_keys, how="inner")
+        # LEFT join on the price spine: at gate closure the prices of day D
+        # are known but D's actual load/generation are not. Keeping those
+        # price rows lets price lags run without gaps; rows with missing
+        # fundamentals are dropped later in training via dropna.
+        master_df = pd.merge(master_df, df_load, on=merge_keys, how="left")
 
     if df_gen is not None:
         merge_keys = ["timestamp"]
         if "bidding_zone" in master_df.columns and "bidding_zone" in df_gen.columns:
             merge_keys.append("bidding_zone")
-        master_df = pd.merge(master_df, df_gen, on=merge_keys, how="inner")
+        master_df = pd.merge(master_df, df_gen, on=merge_keys, how="left")
 
     master_df = master_df.sort_values("timestamp").reset_index(drop=True)
 
