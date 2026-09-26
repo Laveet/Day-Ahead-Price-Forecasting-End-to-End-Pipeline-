@@ -12,8 +12,46 @@ import pandas as pd
 from config import LAKEHOUSE_ROOT, HISTORICAL_SUBFOLDERS
 
 
+def _file_to_hourly(df: pd.DataFrame, mtime: float) -> pd.DataFrame:
+    """
+    Resample ONE file to hourly means and record how complete each hour is.
+
+    The lakehouse mixes resolutions: hourly history, raw 15-min files from
+    after the Oct-2025 switch, and hourly files written by the fixed
+    live_data.py / backfill. Deduplicating raw rows across those would mix
+    an hourly mean with raw quarter-hours of the same hour. Resampling per
+    file first makes every file hourly, and `_coverage` lets the loader
+    prefer a complete hour (4/4 quarter-hours, or 1/1 for hourly data) over
+    a partial one when two files cover the same timestamp.
+    """
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"])
+    if df.empty:
+        return df
+
+    step = df["timestamp"].diff().dropna()
+    step = step.mode().iloc[0] if not step.empty else pd.Timedelta(hours=1)
+    per_hour = max(1, int(pd.Timedelta(hours=1) / step)) if step <= pd.Timedelta(hours=1) else 1
+
+    df["_hour"] = df["timestamp"].dt.floor("h")
+    numeric = [c for c in df.select_dtypes(include="number").columns]
+    agg = {c: "mean" for c in numeric}
+    for c in df.columns:
+        if c not in numeric and c not in ("timestamp", "_hour"):
+            agg[c] = "first"
+    out = df.groupby("_hour").agg(agg)
+    out["_coverage"] = df.groupby("_hour").size() / per_hour
+    out["_mtime"] = mtime
+    return out.rename_axis("timestamp").reset_index()
+
+
 def load_partitioned_parquet(subfolder_name: str) -> pd.DataFrame | None:
-    """Recursively reads and concatenates all parquet files in a subfolder."""
+    """
+    Reads every parquet file in a subfolder, converts each to hourly, and
+    keeps ONE row per hour: the most complete one, newest file on ties
+    (so a re-fetched / backfilled day replaces the old partial file).
+    """
     folder_path = LAKEHOUSE_ROOT / subfolder_name
     if not folder_path.exists():
         print(f"Warning: Directory {folder_path} does not exist.")
@@ -25,8 +63,15 @@ def load_partitioned_parquet(subfolder_name: str) -> pd.DataFrame | None:
         return None
 
     print(f"Found {len(parquet_files)} parquet files in '{subfolder_name}'. Reading and merging...")
-    df_list = [pd.read_parquet(file) for file in parquet_files]
-    return pd.concat(df_list, ignore_index=True)
+    df_list = [_file_to_hourly(pd.read_parquet(f), f.stat().st_mtime) for f in parquet_files]
+    df = pd.concat(df_list, ignore_index=True)
+    df = (
+        df.sort_values(["timestamp", "_coverage", "_mtime"], kind="stable")
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .drop(columns=["_coverage", "_mtime"])
+        .reset_index(drop=True)
+    )
+    return df
 
 
 def load_all_historical() -> dict[str, pd.DataFrame | None]:
@@ -75,12 +120,15 @@ def clean_and_merge_data(raw_data_dict: dict, missing_threshold: float = 0.90) -
     if df_load is not None:
         df_load["timestamp"] = pd.to_datetime(df_load["timestamp"], utc=True)
 
-        if "load_mw" in df_load.columns and "total_load" in df_load.columns:
-            df_load["total_load_mw"] = df_load["load_mw"].combine_first(df_load["total_load"])
-        elif "load_mw" in df_load.columns:
-            df_load["total_load_mw"] = df_load["load_mw"]
-        elif "total_load" in df_load.columns:
-            df_load["total_load_mw"] = df_load["total_load"]
+        # Different pipeline versions stored load under three names. Combine
+        # ALL of them: the old code rebuilt total_load_mw from load_mw /
+        # total_load only, which overwrote the column that every live file
+        # since July 2026 uses -> all recent load silently became NaN.
+        load_series = [df_load[c] for c in ["total_load_mw", "load_mw", "total_load"] if c in df_load.columns]
+        combined_load = load_series[0]
+        for s_ in load_series[1:]:
+            combined_load = combined_load.combine_first(s_)
+        df_load["total_load_mw"] = combined_load
 
         load_cols = ["timestamp", "total_load_mw"]
         if "bidding_zone" in df_load.columns:

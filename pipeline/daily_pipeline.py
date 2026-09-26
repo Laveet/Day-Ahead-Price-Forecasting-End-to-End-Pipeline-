@@ -55,6 +55,24 @@ def _append(master: pd.DataFrame, chunk: pd.DataFrame | None) -> pd.DataFrame:
     )
 
 
+def _as_of_gate_closure(master: pd.DataFrame, run_date: str) -> pd.DataFrame:
+    """
+    Cut history to what was known at 12:00 CET on `run_date` (D):
+      - nothing after delivery day D
+      - for day D itself: prices only (load/generation of D not known yet)
+    For a normal live run this changes nothing. For a REPLAY of a past day
+    (e.g. `python main.py 2026-09-25` while later data is already in the
+    lakehouse) it prevents training on / feeding in information from the
+    future.
+    """
+    D = pd.Timestamp(run_date).date()
+    days = local_date(master["timestamp"])
+    out = master[days <= D].copy()
+    fundamentals = [c for c in out.columns if c not in ("timestamp", "bidding_zone", "price_eur_mwh")]
+    out.loc[local_date(out["timestamp"]) == D, fundamentals] = float("nan")
+    return out.reset_index(drop=True)
+
+
 def run_day_ahead_pipeline(
     master_data: pd.DataFrame,
     run_date: str,
@@ -77,6 +95,11 @@ def run_day_ahead_pipeline(
     d_target = (D + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     print(f"Run date D={d_today} | actuals through {d_prev} | prices through {d_today} "
           f"| forecasting delivery day {d_target}")
+
+    # Keep the full history aside: in a replay it already contains the
+    # actual prices of D+1, which lets us grade the forecast immediately.
+    known_later = master_data
+    master_data = _as_of_gate_closure(master_data, d_today)
 
     # ---- STEP 1: complete actuals for D-1 ---------------------------------
     actual_prev = fetch_align_and_save_live_data(d_prev, bidding_zone)
@@ -108,6 +131,7 @@ def run_day_ahead_pipeline(
     # ---- STEP 6: unified timeline -> one feature-engineering call ----------
     combined = pd.concat([master_updated, forecast_inputs], ignore_index=True)
     combined["bidding_zone"] = combined["bidding_zone"].ffill().bfill()
+    combined = combined.drop_duplicates(subset=["timestamp"], keep="last")
     combined_features = engineer_features(combined)
 
     future_features = combined_features[
@@ -139,5 +163,12 @@ def run_day_ahead_pipeline(
     })
 
     save_forecast(forecast_result, d_target, bidding_zone)
+
+    # Replay: actual prices for D+1 are already known -> grade right away.
+    actual_target = known_later[local_date(known_later["timestamp"]) == pd.Timestamp(d_target).date()]
+    actual_target = actual_target.dropna(subset=["price_eur_mwh"])
+    if len(actual_target) == expected:
+        print(f"Actual prices for {d_target} already known (replay) — grading now:")
+        compare_forecast_vs_actual(actual_target, d_target, bidding_zone)
 
     return master_updated, model, forecast_result

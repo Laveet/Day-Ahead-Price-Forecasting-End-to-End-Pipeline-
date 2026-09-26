@@ -19,6 +19,8 @@ import numpy as np
 import pandas as pd
 
 from config import DEFAULT_BIDDING_ZONE
+from entsoe.exceptions import NoMatchingDataError
+
 from data.entsoe_client import get_client
 from data.market_time import delivery_day_bounds
 
@@ -32,8 +34,22 @@ def fetch_next_day_forecast_inputs(target_date_str: str, bidding_zone: str = DEF
 
     print(f"Downloading forecasts for {target_date_str}...")
 
-    load_forecast = client.query_load_forecast(bidding_zone, start=start, end=end)
-    wind_solar = client.query_wind_and_solar_forecast(bidding_zone, start=start, end=end)
+    try:
+        load_forecast = client.query_load_forecast(bidding_zone, start=start, end=end)
+    except NoMatchingDataError:
+        raise RuntimeError(
+            f"ENTSO-E has no day-ahead LOAD forecast for {target_date_str} yet. "
+            "It is usually published on the morning of the day before delivery; "
+            "re-run later (but before the 12:00 CET gate closure)."
+        ) from None
+    try:
+        wind_solar = client.query_wind_and_solar_forecast(bidding_zone, start=start, end=end)
+    except NoMatchingDataError:
+        raise RuntimeError(
+            f"ENTSO-E has no day-ahead WIND/SOLAR forecast for {target_date_str} yet. "
+            "Run `python diagnose_forecast.py` to see what is published, then "
+            "re-run main.py later (but before the 12:00 CET gate closure)."
+        ) from None
 
     # Some entsoe-py versions return query_load_forecast as a single-column
     # DataFrame instead of a Series -> .values would be 2-D. ravel() flattens
