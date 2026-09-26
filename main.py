@@ -23,7 +23,7 @@ if __name__ == "__main__":
     raw_data = load_all_historical()
     master_energy_df = clean_and_merge_data(raw_data)
 
-    master_updated, model, forecast_result = run_day_ahead_pipeline(master_energy_df, "2026-08-01")
+    master_updated, model, forecast_result = run_day_ahead_pipeline(master_energy_df, "2026-09-06")
 
     print("\nForecast:")
     print(forecast_result)
