@@ -4,3 +4,7 @@ lightgbm
 entsoe-py
 python-dotenv
 pyarrow
+yfinance
+openpyxl
+requests
+matplotlib

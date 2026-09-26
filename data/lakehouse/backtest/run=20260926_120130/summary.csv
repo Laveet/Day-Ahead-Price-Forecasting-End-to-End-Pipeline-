@@ -1,0 +1,5 @@
+model,MAE,RMSE,bias (actual-forecast),rMAE vs naive_week,MAE negative-price hours
+lgbm_base,16.227,25.862,5.288,0.44,23.651
+lgbm_ttf,15.081,25.151,4.791,0.409,23.187
+naive_week,36.841,56.644,0.914,1.0,55.101
+naive_day,29.424,46.966,0.26,0.799,41.185

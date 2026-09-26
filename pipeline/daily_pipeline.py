@@ -24,6 +24,8 @@ ends) and then forecast day_x+1, whose auction had already closed at noon
 on day_x. The forecast could not have been used for bidding.
 
 Every run:
+  0) refresh the gas price (TTF) and align it: delivery day T uses the
+     last close dated <= T-2 (the D-1 settlement is not known at 12:00 on D)
   1) actual load + generation for D-1 (+ its prices) -> full history rows
   2) prices for D                                     -> price-only rows
   3) grade the forecast archived yesterday for D
@@ -40,6 +42,7 @@ from data.live_data import fetch_and_save_prices, fetch_align_and_save_live_data
 from data.forecast_data import fetch_next_day_forecast_inputs
 from data.market_time import hours_in_delivery_day, local_date
 from features.engineering import engineer_features
+from data.fuel_data import refresh_fuel_data, join_fuel
 from models.training import train_price_model
 from evaluation.forecast_tracker import save_forecast, compare_forecast_vs_actual
 
@@ -101,6 +104,19 @@ def run_day_ahead_pipeline(
     known_later = master_data
     master_data = _as_of_gate_closure(master_data, d_today)
 
+    # ---- STEP 0: refresh gas price (TTF) -----------------------------------
+    # Fails loudly if Yahoo returns nothing or the data fails validation:
+    # a model trained with gas must not silently run without it.
+    try:
+        fuel = refresh_fuel_data(verbose=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"Gas price (TTF) refresh failed: {e}\n"
+            "The model uses ttf_eur_mwh as an input, so the forecast is stopped. "
+            "Check your internet, try `pip install -U yfinance`, or run "
+            "`python -m data.fuel_data` to see the full error."
+        ) from e
+
     # ---- STEP 1: complete actuals for D-1 ---------------------------------
     actual_prev = fetch_align_and_save_live_data(d_prev, bidding_zone)
     master_updated = _append(master_data, actual_prev)
@@ -122,7 +138,7 @@ def run_day_ahead_pipeline(
     compare_forecast_vs_actual(prices_today, d_today, bidding_zone)
 
     # ---- STEP 4: feature engineer + train ----------------------------------
-    features = engineer_features(master_updated)
+    features = join_fuel(engineer_features(master_updated), fuel)
     model = train_price_model(features)
 
     # ---- STEP 5: forecasts for D+1 -----------------------------------------
@@ -132,7 +148,7 @@ def run_day_ahead_pipeline(
     combined = pd.concat([master_updated, forecast_inputs], ignore_index=True)
     combined["bidding_zone"] = combined["bidding_zone"].ffill().bfill()
     combined = combined.drop_duplicates(subset=["timestamp"], keep="last")
-    combined_features = engineer_features(combined)
+    combined_features = join_fuel(engineer_features(combined), fuel)
 
     future_features = combined_features[
         local_date(combined_features.timestamp) == pd.Timestamp(d_target).date()
@@ -144,6 +160,15 @@ def run_day_ahead_pipeline(
             f"Expected {expected} forecast rows for delivery day {d_target}, "
             f"got {len(future_features)}. Check the ENTSO-E forecast download."
         )
+
+    target_fuel = fuel[fuel["delivery_date"] == pd.Timestamp(d_target)]
+    if target_fuel.empty or target_fuel["ttf_eur_mwh"].isna().any():
+        raise RuntimeError(f"No gas price available for delivery day {d_target}.")
+    age = int(target_fuel["ttf_age_days"].iloc[0])
+    print(f"Gas price for {d_target}: {target_fuel.ttf_eur_mwh.iloc[0]:.2f} EUR/MWh "
+          f"(close of {target_fuel.ttf_obs_date.iloc[0].date()}, {age} days before delivery)")
+    if age > 5:
+        print(f"  WARNING: gas price is {age} days old — Yahoo may be lagging.")
 
     nan_cols = future_features[MODEL_FEATURES].columns[
         future_features[MODEL_FEATURES].isna().any()
